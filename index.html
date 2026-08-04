@@ -310,27 +310,31 @@
   const STATIONS = [
   {
     freq: '102.3',
+    band: 'FM',
     name: 'Aspen AR',
     desc: 'Pura Música las 24 hs',
     url: 'http://playerservices.streamtheworld.com/api/livestream-redirect/ASPENAAC.aac'
   },
   {
     freq: '100.7',
+    band: 'FM',
     name: 'Blue AR',
     desc: 'Buenas canciones',
     url: 'https://playerservices.streamtheworld.com/api/livestream-redirect/BLUE_FM_100_7AAC.aac'
   },
   {
     freq: '102.2',
+    band: 'FM',
     name: 'Greatest Hits Radio UK',
     desc: 'Greatest Hits Radio',
     url: 'https://edge-bauermz-03-gos2.sharp-stream.com/net2devon.mp3?aw_0_1st.skey=1602676850'
   },
   {
     freq: '648',
-    name: 'Radio Caroline UK',
+    band: 'AM',
+    name: 'Radio Caroline',
     desc: 'Pirate radio, then and now',
-    url: 'https://stream.radiocaroline.net/rc128/;stream.mp3'
+    url: 'https://stream.radiocaroline.net/rc128'
   }
 ];
 
@@ -352,20 +356,20 @@
   }
 
   STATIONS.forEach((st, i) => {
-    const btn = document.createElement('button');
-    btn.className = 'station-btn';
-    btn.innerHTML = `
-      <div class="freq">${st.freq}<small>FM</small></div>
-      <div class="meta">
-        <div class="name">${st.name}</div>
-        <div class="desc">${st.desc}</div>
-      </div>
-      <div class="play-icon">${playIconSvg()}</div>
-    `;
-    btn.addEventListener('click', () => toggleStation(i));
-    stationsEl.appendChild(btn);
-    buttons.push(btn);
-  });
+  const btn = document.createElement('button');
+  btn.className = 'station-btn';
+  btn.innerHTML = `
+    <div class="freq">${st.freq}<small>${st.band}</small></div>
+    <div class="meta">
+      <div class="name">${st.name}</div>
+      <div class="desc">${st.desc}</div>
+    </div>
+    <div class="play-icon">${playIconSvg()}</div>
+  `;
+  btn.addEventListener('click', () => toggleStation(i));
+  stationsEl.appendChild(btn);
+  buttons.push(btn);
+});
 
   function setStatus(state) {
     // state: 'off' | 'buffering' | 'live'
