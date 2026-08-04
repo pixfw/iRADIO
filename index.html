@@ -283,7 +283,7 @@
     <span></span><span></span><span></span><span></span><span></span><span></span><span></span>
   </div>
 
-  <h1>Radio Dial</h1>
+  <h1>Internet Radio</h1>
   <div class="subtitle">Sintonía en vivo &middot; toca para escuchar</div>
 
   <div class="display">
@@ -300,43 +300,43 @@
 
   <div class="stations" id="stations"></div>
 
-  <div class="hint">Si el audio no comienza al primer toque, vuelve a presionar. Diseñado por sduenasv@yahoo.com.</div>
+  <div class="hint">Si el audio no comienza al primer toque, vuelve a presionar. Diseñado por sduenasv@yahoo.com</div>
 </div>
 
 <audio id="player" preload="none"></audio>
 
 <script>
-  // ---- Configura aquí tus tres emisoras ----
+  // ---- Configura aquí tus emisoras ----
   const STATIONS = [
-  {
-    freq: '102.3',
-    band: 'FM',
-    name: 'Aspen AR',
-    desc: 'Pura Música las 24 hs',
-    url: 'http://playerservices.streamtheworld.com/api/livestream-redirect/ASPENAAC.aac'
-  },
-  {
-    freq: '100.7',
-    band: 'FM',
-    name: 'Blue AR',
-    desc: 'Buenas canciones',
-    url: 'https://playerservices.streamtheworld.com/api/livestream-redirect/BLUE_FM_100_7AAC.aac'
-  },
-  {
-    freq: '102.2',
-    band: 'DAB',
-    name: 'Greatest Hits Radio UK',
-    desc: 'Greatest Hits Radio',
-    url: 'https://edge-bauermz-03-gos2.sharp-stream.com/net2devon.mp3?aw_0_1st.skey=1602676850'
-  },
-  {
-    freq: '648',
-    band: 'AM',
-    name: 'Radio Caroline UK',
-    desc: 'Pirate radio, then and now',
-    url: 'https://stream.radiocaroline.net/rc128/;stream.mp3'
-  }
-];
+    {
+      freq: '102.3',
+      band: 'FM',
+      name: 'Aspen AR',
+      desc: 'Pura Música las 24 hs',
+      url: 'http://playerservices.streamtheworld.com/api/livestream-redirect/ASPENAAC.aac'
+    },
+    {
+      freq: '100.7',
+      band: 'FM',
+      name: 'Blue AR',
+      desc: 'Buenas canciones',
+      url: 'https://playerservices.streamtheworld.com/api/livestream-redirect/BLUE_FM_100_7AAC.aac'
+    },
+    {
+      freq: '102.2',
+      band: 'DAB',
+      name: 'Greatest Hits Radio UK',
+      desc: 'Greatest Hits Radio',
+      url: 'https://edge-bauermz-03-gos2.sharp-stream.com/net2devon.mp3?aw_0_1st.skey=1602676850'
+    },
+    {
+      freq: '648',
+      band: 'AM',
+      name: 'Radio Caroline UK',
+      desc: 'Pirate radio, then and now',
+      url: 'https://stream.radiocaroline.net/rc128/;stream.mp3'
+    }
+  ];
 
   const player = document.getElementById('player');
   const stationsEl = document.getElementById('stations');
@@ -348,6 +348,11 @@
   let currentIndex = null;
   let buttons = [];
 
+  // --- estado de reconexión ---
+  let reconnectAttempts = 0;
+  let reconnectTimer = null;
+  let manualStop = false; // true cuando el usuario detiene a propósito
+
   function playIconSvg() {
     return '<svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>';
   }
@@ -356,20 +361,20 @@
   }
 
   STATIONS.forEach((st, i) => {
-  const btn = document.createElement('button');
-  btn.className = 'station-btn';
-  btn.innerHTML = `
-    <div class="freq">${st.freq}<small>${st.band}</small></div>
-    <div class="meta">
-      <div class="name">${st.name}</div>
-      <div class="desc">${st.desc}</div>
-    </div>
-    <div class="play-icon">${playIconSvg()}</div>
-  `;
-  btn.addEventListener('click', () => toggleStation(i));
-  stationsEl.appendChild(btn);
-  buttons.push(btn);
-});
+    const btn = document.createElement('button');
+    btn.className = 'station-btn';
+    btn.innerHTML = `
+      <div class="freq">${st.freq}<small>${st.band}</small></div>
+      <div class="meta">
+        <div class="name">${st.name}</div>
+        <div class="desc">${st.desc}</div>
+      </div>
+      <div class="play-icon">${playIconSvg()}</div>
+    `;
+    btn.addEventListener('click', () => toggleStation(i));
+    stationsEl.appendChild(btn);
+    buttons.push(btn);
+  });
 
   function setStatus(state) {
     // state: 'off' | 'buffering' | 'live'
@@ -394,9 +399,54 @@
     });
   }
 
+  const MAX_RECONNECT_ATTEMPTS = 20;
+
+  function stopAfterMaxRetries() {
+    clearTimeout(reconnectTimer);
+    manualStop = true;
+    reconnectAttempts = 0;
+    player.pause();
+    player.src = '';
+    currentIndex = null;
+    stationNameEl.textContent = 'No se pudo reconectar — intenta de nuevo';
+    setStatus('off');
+    updateButtons();
+  }
+
+  function attemptReconnect() {
+    if (currentIndex === null || manualStop) return;
+
+    if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+      stopAfterMaxRetries();
+      return;
+    }
+
+    clearTimeout(reconnectTimer);
+    const delay = Math.min(2000 * Math.pow(1.5, reconnectAttempts), 15000); // backoff hasta 15s
+    reconnectAttempts++;
+
+    setStatus('buffering');
+    stationNameEl.textContent = STATIONS[currentIndex].name + ` — reconectando (${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})…`;
+
+    reconnectTimer = setTimeout(() => {
+      if (currentIndex === null || manualStop) return;
+      const st = STATIONS[currentIndex];
+      player.src = ''; // fuerza reset del elemento de audio
+      player.src = st.url;
+      player.load();
+      const p = player.play();
+      if (p !== undefined) {
+        p.catch(() => attemptReconnect()); // si falla otra vez, reintenta (o detiene si llegó al máximo)
+      }
+    }, delay);
+  }
+
   function toggleStation(i) {
     if (currentIndex === i) {
-      // stop
+      // stop manual
+      manualStop = true;
+      clearTimeout(reconnectTimer);
+      reconnectAttempts = 0;
       player.pause();
       player.src = '';
       currentIndex = null;
@@ -405,6 +455,10 @@
       updateButtons();
       return;
     }
+
+    manualStop = false;
+    reconnectAttempts = 0;
+    clearTimeout(reconnectTimer);
 
     currentIndex = i;
     const st = STATIONS[i];
@@ -416,21 +470,42 @@
     player.load();
     const playPromise = player.play();
     if (playPromise !== undefined) {
-      playPromise.catch(() => {
-        setStatus('off');
-        stationNameEl.textContent = 'No se pudo reproducir — intenta de nuevo';
-      });
+      playPromise.catch(() => attemptReconnect());
     }
   }
 
-  player.addEventListener('playing', () => setStatus('live'));
+  player.addEventListener('playing', () => {
+    reconnectAttempts = 0; // se reconectó bien, resetea el contador de backoff
+    setStatus('live');
+    if (currentIndex !== null) {
+      stationNameEl.textContent = STATIONS[currentIndex].name;
+    }
+  });
   player.addEventListener('waiting', () => setStatus('buffering'));
-  player.addEventListener('pause', () => { if (currentIndex !== null) setStatus('buffering'); });
+  player.addEventListener('pause', () => {
+    if (currentIndex !== null && !manualStop) setStatus('buffering');
+  });
+  player.addEventListener('stalled', () => attemptReconnect());
   player.addEventListener('error', () => {
-    setStatus('off');
-    stationNameEl.textContent = 'Error de conexión — intenta de nuevo';
-    currentIndex = null;
-    updateButtons();
+    if (currentIndex !== null && !manualStop) {
+      attemptReconnect();
+    } else {
+      setStatus('off');
+    }
+  });
+
+  // Detecta cuando el navegador recupera / pierde la conexión a internet
+  window.addEventListener('online', () => {
+    if (currentIndex !== null && !manualStop) {
+      reconnectAttempts = 0;
+      attemptReconnect();
+    }
+  });
+  window.addEventListener('offline', () => {
+    if (currentIndex !== null) {
+      setStatus('buffering');
+      stationNameEl.textContent = STATIONS[currentIndex].name + ' — sin conexión';
+    }
   });
 
   // Register service worker for basic offline app-shell / installability
