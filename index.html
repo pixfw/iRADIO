@@ -351,7 +351,13 @@
   // --- estado de reconexión ---
   let reconnectAttempts = 0;
   let reconnectTimer = null;
-  let manualStop = false; // true cuando el usuario detiene a propósito
+  let reconnectScheduled = false; // evita que varios eventos (waiting/stalled/error/pause)
+                                   // del MISMO corte programen intentos duplicados
+  let manualStop = false;         // true cuando el usuario detiene a propósito
+  let stallWatchdog = null;       // detecta "buffering" colgado que nunca dispara error/stalled
+
+  const MAX_RECONNECT_ATTEMPTS = 20;
+  const STALL_TIMEOUT_MS = 8000;  // si sigue "buffering" más de esto sin reproducir, forzar reintento
 
   function playIconSvg() {
     return '<svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>';
@@ -399,46 +405,116 @@
     });
   }
 
-  const MAX_RECONNECT_ATTEMPTS = 20;
+  // --- helpers de audio ---
+
+  // Limpia el elemento de audio de forma segura. Usar src = '' puede disparar
+  // un evento 'error' espurio en varios navegadores móviles, que a su vez
+  // retroalimentaba nuestro propio manejador de error. removeAttribute evita eso.
+  function resetPlayer() {
+    player.pause();
+    player.removeAttribute('src');
+    player.load();
+  }
+
+  // Añade un parámetro anti-caché en cada (re)conexión: algunos redirects de
+  // streaming (CDN / proxy del operador móvil) pueden quedar cacheados con una
+  // respuesta rota, y reintentar la URL idéntica pega contra el mismo caché.
+  function urlWithCacheBust(url) {
+    const sep = url.includes('?') ? '&' : '?';
+    return url + sep + '_cb=' + Date.now();
+  }
+
+  function armStallWatchdog() {
+    clearTimeout(stallWatchdog);
+    stallWatchdog = setTimeout(() => {
+      if (currentIndex !== null && !manualStop) {
+        attemptReconnect();
+      }
+    }, STALL_TIMEOUT_MS);
+  }
+  function disarmStallWatchdog() {
+    clearTimeout(stallWatchdog);
+  }
 
   function stopAfterMaxRetries() {
     clearTimeout(reconnectTimer);
+    disarmStallWatchdog();
+    reconnectScheduled = false;
     manualStop = true;
     reconnectAttempts = 0;
-    player.pause();
-    player.src = '';
+    resetPlayer();
     currentIndex = null;
     stationNameEl.textContent = 'No se pudo reconectar — intenta de nuevo';
     setStatus('off');
     updateButtons();
   }
 
+  // Ejecuta la reconexión real (llamada desde el temporizador con backoff,
+  // o directamente cuando vuelve la red).
+  function connectNow() {
+    reconnectScheduled = false;
+    if (currentIndex === null || manualStop) return;
+
+    const st = STATIONS[currentIndex];
+    setStatus('buffering');
+    stationNameEl.textContent = st.name + ' — reconectando…';
+
+    resetPlayer();
+    player.src = urlWithCacheBust(st.url);
+    player.load();
+    armStallWatchdog();
+    const p = player.play();
+    if (p !== undefined) {
+      p.catch(() => attemptReconnect());
+    }
+  }
+
   function attemptReconnect() {
     if (currentIndex === null || manualStop) return;
+
+    // Sin red del todo: no tiene sentido gastar intentos. Esperamos al evento
+    // 'online' (más abajo), que dispara connectNow() de inmediato al volver.
+    if (!navigator.onLine) {
+      disarmStallWatchdog();
+      clearTimeout(reconnectTimer);
+      reconnectScheduled = false;
+      setStatus('buffering');
+      stationNameEl.textContent = STATIONS[currentIndex].name + ' — sin conexión, esperando red…';
+      return;
+    }
+
+    // Ya hay un intento programado para este mismo corte: no lo dupliques.
+    // (waiting/stalled/error/pause pueden dispararse todos para un solo evento real)
+    if (reconnectScheduled) return;
 
     if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
       stopAfterMaxRetries();
       return;
     }
 
-    clearTimeout(reconnectTimer);
+    disarmStallWatchdog();
     const delay = Math.min(2000 * Math.pow(1.5, reconnectAttempts), 15000); // backoff hasta 15s
     reconnectAttempts++;
+    reconnectScheduled = true;
 
     setStatus('buffering');
     stationNameEl.textContent = STATIONS[currentIndex].name + ` — reconectando (${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})…`;
 
+    clearTimeout(reconnectTimer);
     reconnectTimer = setTimeout(() => {
-      if (currentIndex === null || manualStop) return;
-      const st = STATIONS[currentIndex];
-      player.src = ''; // fuerza reset del elemento de audio
-      player.src = st.url;
-      player.load();
-      const p = player.play();
-      if (p !== undefined) {
-        p.catch(() => attemptReconnect()); // si falla otra vez, reintenta (o detiene si llegó al máximo)
-      }
+      reconnectScheduled = false;
+      connectNow();
     }, delay);
+  }
+
+  function updateMediaSession(st) {
+    if ('mediaSession' in navigator && 'MediaMetadata' in window) {
+      navigator.mediaSession.metadata = new MediaMetadata({
+        title: st.name,
+        artist: st.desc,
+        album: st.freq + ' ' + st.band
+      });
+    }
   }
 
   function toggleStation(i) {
@@ -446,28 +522,35 @@
       // stop manual
       manualStop = true;
       clearTimeout(reconnectTimer);
+      disarmStallWatchdog();
+      reconnectScheduled = false;
       reconnectAttempts = 0;
-      player.pause();
-      player.src = '';
+      resetPlayer();
       currentIndex = null;
       stationNameEl.textContent = 'Selecciona una emisora';
       setStatus('off');
       updateButtons();
+      if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'none';
       return;
     }
 
     manualStop = false;
     reconnectAttempts = 0;
+    reconnectScheduled = false;
     clearTimeout(reconnectTimer);
+    disarmStallWatchdog();
 
     currentIndex = i;
     const st = STATIONS[i];
     stationNameEl.textContent = st.name;
     setStatus('buffering');
     updateButtons();
+    updateMediaSession(st);
 
-    player.src = st.url;
+    resetPlayer();
+    player.src = urlWithCacheBust(st.url);
     player.load();
+    armStallWatchdog();
     const playPromise = player.play();
     if (playPromise !== undefined) {
       playPromise.catch(() => attemptReconnect());
@@ -476,12 +559,17 @@
 
   player.addEventListener('playing', () => {
     reconnectAttempts = 0; // se reconectó bien, resetea el contador de backoff
+    disarmStallWatchdog();
     setStatus('live');
     if (currentIndex !== null) {
       stationNameEl.textContent = STATIONS[currentIndex].name;
+      if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'playing';
     }
   });
-  player.addEventListener('waiting', () => setStatus('buffering'));
+  player.addEventListener('waiting', () => {
+    setStatus('buffering');
+    armStallWatchdog(); // si se queda "colgado" en buffering, forzamos reconexión
+  });
   player.addEventListener('pause', () => {
     if (currentIndex !== null && !manualStop) setStatus('buffering');
   });
@@ -494,19 +582,55 @@
     }
   });
 
-  // Detecta cuando el navegador recupera / pierde la conexión a internet
+  // Detecta cuando el navegador recupera / pierde la conexión a internet.
+  // Esto es lo más importante en redes móviles: si se pierde la señal del
+  // todo, dejamos de gastar intentos y reconectamos al instante al volver.
   window.addEventListener('online', () => {
     if (currentIndex !== null && !manualStop) {
       reconnectAttempts = 0;
-      attemptReconnect();
+      clearTimeout(reconnectTimer);
+      reconnectScheduled = false;
+      connectNow();
     }
   });
   window.addEventListener('offline', () => {
     if (currentIndex !== null) {
+      clearTimeout(reconnectTimer);
+      disarmStallWatchdog();
+      reconnectScheduled = false;
       setStatus('buffering');
       stationNameEl.textContent = STATIONS[currentIndex].name + ' — sin conexión';
     }
   });
+
+  // Al volver de segundo plano / pantalla bloqueada, el audio puede haber
+  // quedado suspendido por el sistema operativo sin disparar ningún evento
+  // del <audio>. Revisamos activamente al recuperar el foco.
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible' && currentIndex !== null && !manualStop) {
+      if (player.paused || player.readyState < 2) {
+        reconnectAttempts = 0;
+        clearTimeout(reconnectTimer);
+        reconnectScheduled = false;
+        connectNow();
+      }
+    }
+  });
+
+  // Media Session: ayuda a que iOS/Android traten esto como audio legítimo
+  // en segundo plano (menos probable que el SO mate el stream) y da controles
+  // en la pantalla de bloqueo.
+  if ('mediaSession' in navigator) {
+    navigator.mediaSession.setActionHandler('play', () => {
+      if (currentIndex !== null) player.play().catch(() => attemptReconnect());
+    });
+    navigator.mediaSession.setActionHandler('pause', () => {
+      if (currentIndex !== null) toggleStation(currentIndex);
+    });
+    navigator.mediaSession.setActionHandler('stop', () => {
+      if (currentIndex !== null) toggleStation(currentIndex);
+    });
+  }
 
   // Register service worker for basic offline app-shell / installability
   if ('serviceWorker' in navigator) {
