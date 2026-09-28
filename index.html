@@ -313,7 +313,8 @@
       band: 'FM',
       name: 'Aspen AR',
       desc: 'Pura Música las 24 hs',
-      url: 'http://playerservices.streamtheworld.com/api/livestream-redirect/ASPENAAC.aac'
+      // https: evita bloqueos por contenido mixto en redes móviles
+      url: 'https://playerservices.streamtheworld.com/api/livestream-redirect/ASPENAAC.aac'
     },
     {
       freq: '100.7',
@@ -327,6 +328,8 @@
       band: 'DAB',
       name: 'Greatest Hits Radio UK',
       desc: 'Greatest Hits Radio',
+      // OJO: el parámetro skey es de sesión y puede caducar. Si falla al
+      // reconectar, prueba quitando todo lo que va después del "?".
       url: 'https://edge-bauermz-03-gos2.sharp-stream.com/net2devon.mp3?aw_0_1st.skey=1602676850'
     },
     {
@@ -338,7 +341,7 @@
     }
   ];
 
-  const player = document.getElementById('player');
+  let player = document.getElementById('player');   // let: puede recrearse (reinicio duro)
   const stationsEl = document.getElementById('stations');
   const stationNameEl = document.getElementById('stationName');
   const statusDot = document.getElementById('statusDot');
@@ -351,13 +354,24 @@
   // --- estado de reconexión ---
   let reconnectAttempts = 0;
   let reconnectTimer = null;
-  let reconnectScheduled = false; // evita que varios eventos (waiting/stalled/error/pause)
-                                   // del MISMO corte programen intentos duplicados
+  let reconnectScheduled = false; // evita intentos duplicados para el mismo corte
   let manualStop = false;         // true cuando el usuario detiene a propósito
-  let stallWatchdog = null;       // detecta "buffering" colgado que nunca dispara error/stalled
+  let stallWatchdog = null;       // buffering colgado
+  let pauseTimer = null;          // pausas externas (SO, llamadas, auriculares...)
+  let netDebounce = null;
+
+  // --- heartbeat: detecta congelamientos silenciosos (sin eventos) ---
+  let heartbeat = null;
+  let lastTime = 0;
+  let lastProgressAt = Date.now();
 
   const MAX_RECONNECT_ATTEMPTS = 20;
-  const STALL_TIMEOUT_MS = 8000;  // si sigue "buffering" más de esto sin reproducir, forzar reintento
+  const STALL_TIMEOUT_MS = 8000;      // buffering sin reproducir
+  const FREEZE_TIMEOUT_MS = 10000;    // currentTime sin avanzar
+  const HARD_RESET_AFTER = 3;         // tras N intentos fallidos, recrear el <audio>
+
+  const IS_IOS = /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+                 (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
 
   function playIconSvg() {
     return '<svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>';
@@ -405,41 +419,80 @@
     });
   }
 
-  // --- helpers de audio ---
+  // ---------- helpers de audio ----------
 
-  // Limpia el elemento de audio de forma segura. Usar src = '' puede disparar
-  // un evento 'error' espurio en varios navegadores móviles, que a su vez
-  // retroalimentaba nuestro propio manejador de error. removeAttribute evita eso.
+  // removeAttribute('src') en vez de src='' para no disparar un 'error' espurio.
   function resetPlayer() {
     player.pause();
     player.removeAttribute('src');
     player.load();
   }
 
-  // Añade un parámetro anti-caché en cada (re)conexión: algunos redirects de
-  // streaming (CDN / proxy del operador móvil) pueden quedar cacheados con una
-  // respuesta rota, y reintentar la URL idéntica pega contra el mismo caché.
+  // Parámetro anti-caché en cada (re)conexión.
   function urlWithCacheBust(url) {
     const sep = url.includes('?') ? '&' : '?';
     return url + sep + '_cb=' + Date.now();
   }
 
+  // Reinicio "duro": reemplaza el <audio> por uno nuevo, descartando estados
+  // internos rotos. En iOS NO se hace: un <audio> nuevo pierde el desbloqueo
+  // por gesto del usuario y play() sería rechazado.
+  function recreateAudio() {
+    const old = player;
+    const fresh = document.createElement('audio');
+    fresh.id = 'player';
+    fresh.preload = 'none';
+    try { old.pause(); old.removeAttribute('src'); old.load(); } catch (e) {}
+    old.replaceWith(fresh);
+    player = fresh;
+    bindPlayerEvents(fresh);
+  }
+
+  // ---------- watchdogs ----------
+
   function armStallWatchdog() {
     clearTimeout(stallWatchdog);
     stallWatchdog = setTimeout(() => {
-      if (currentIndex !== null && !manualStop) {
-        attemptReconnect();
-      }
+      if (currentIndex !== null && !manualStop) attemptReconnect();
     }, STALL_TIMEOUT_MS);
   }
   function disarmStallWatchdog() {
     clearTimeout(stallWatchdog);
   }
 
-  function stopAfterMaxRetries() {
+  function startHeartbeat() {
+    clearInterval(heartbeat);
+    lastTime = 0;
+    lastProgressAt = Date.now();
+    heartbeat = setInterval(() => {
+      if (currentIndex === null || manualStop) return;
+      // Mientras hay una reconexión en curso, no medir.
+      if (reconnectScheduled) { lastProgressAt = Date.now(); return; }
+
+      if (player.currentTime !== lastTime) {
+        lastTime = player.currentTime;
+        lastProgressAt = Date.now();
+      } else if (Date.now() - lastProgressAt > FREEZE_TIMEOUT_MS) {
+        lastProgressAt = Date.now();
+        attemptReconnect();
+      }
+    }, 2000);
+  }
+  function stopHeartbeat() {
+    clearInterval(heartbeat);
+  }
+
+  function clearAllTimers() {
     clearTimeout(reconnectTimer);
+    clearTimeout(pauseTimer);
+    clearTimeout(netDebounce);
     disarmStallWatchdog();
+    stopHeartbeat();
     reconnectScheduled = false;
+  }
+
+  function stopAfterMaxRetries() {
+    clearAllTimers();
     manualStop = true;
     reconnectAttempts = 0;
     resetPlayer();
@@ -449,31 +502,57 @@
     updateButtons();
   }
 
-  // Ejecuta la reconexión real (llamada desde el temporizador con backoff,
-  // o directamente cuando vuelve la red).
+  // El navegador bloqueó play() por falta de gesto del usuario:
+  // reintentar solo en bucle no sirve, hay que pedir un toque.
+  function needsTap() {
+    clearAllTimers();
+    manualStop = true;
+    reconnectAttempts = 0;
+    resetPlayer();
+    currentIndex = null;
+    stationNameEl.textContent = 'Toca la emisora para reanudar';
+    setStatus('off');
+    updateButtons();
+  }
+
+  // Rechazo de play(): ignorar AbortError (lo provoca nuestro propio load()).
+  function onPlayReject(err) {
+    if (err && err.name === 'AbortError') return;
+    if (err && err.name === 'NotAllowedError') { needsTap(); return; }
+    attemptReconnect();
+  }
+
+  // ---------- reconexión ----------
+
+  // Reconexión real (desde el temporizador con backoff, o al volver la red).
   function connectNow() {
     reconnectScheduled = false;
+    clearTimeout(pauseTimer);
     if (currentIndex === null || manualStop) return;
 
     const st = STATIONS[currentIndex];
     setStatus('buffering');
     stationNameEl.textContent = st.name + ' — reconectando…';
 
-    resetPlayer();
+    // Si ya falló varias veces, recrear el elemento <audio> (excepto iOS).
+    if (!IS_IOS && reconnectAttempts >= HARD_RESET_AFTER) {
+      recreateAudio();
+    } else {
+      resetPlayer();
+    }
+
     player.src = urlWithCacheBust(st.url);
     player.load();
     armStallWatchdog();
+    startHeartbeat();
     const p = player.play();
-    if (p !== undefined) {
-      p.catch(() => attemptReconnect());
-    }
+    if (p !== undefined) p.catch(onPlayReject);
   }
 
   function attemptReconnect() {
     if (currentIndex === null || manualStop) return;
 
-    // Sin red del todo: no tiene sentido gastar intentos. Esperamos al evento
-    // 'online' (más abajo), que dispara connectNow() de inmediato al volver.
+    // Sin red: no gastar intentos; esperamos 'online' / cambio de conexión.
     if (!navigator.onLine) {
       disarmStallWatchdog();
       clearTimeout(reconnectTimer);
@@ -483,8 +562,7 @@
       return;
     }
 
-    // Ya hay un intento programado para este mismo corte: no lo dupliques.
-    // (waiting/stalled/error/pause pueden dispararse todos para un solo evento real)
+    // Ya hay un intento programado para este corte: no duplicar.
     if (reconnectScheduled) return;
 
     if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
@@ -507,6 +585,15 @@
     }, delay);
   }
 
+  // Reconexión inmediata (cambio de red, volver a primer plano...)
+  function reconnectImmediately() {
+    if (currentIndex === null || manualStop) return;
+    reconnectAttempts = 0;
+    clearTimeout(reconnectTimer);
+    reconnectScheduled = false;
+    connectNow();
+  }
+
   function updateMediaSession(st) {
     if ('mediaSession' in navigator && 'MediaMetadata' in window) {
       navigator.mediaSession.metadata = new MediaMetadata({
@@ -521,9 +608,7 @@
     if (currentIndex === i) {
       // stop manual
       manualStop = true;
-      clearTimeout(reconnectTimer);
-      disarmStallWatchdog();
-      reconnectScheduled = false;
+      clearAllTimers();
       reconnectAttempts = 0;
       resetPlayer();
       currentIndex = null;
@@ -536,9 +621,7 @@
 
     manualStop = false;
     reconnectAttempts = 0;
-    reconnectScheduled = false;
-    clearTimeout(reconnectTimer);
-    disarmStallWatchdog();
+    clearAllTimers();
 
     currentIndex = i;
     const st = STATIONS[i];
@@ -551,50 +634,81 @@
     player.src = urlWithCacheBust(st.url);
     player.load();
     armStallWatchdog();
+    startHeartbeat();
     const playPromise = player.play();
-    if (playPromise !== undefined) {
-      playPromise.catch(() => attemptReconnect());
-    }
+    if (playPromise !== undefined) playPromise.catch(onPlayReject);
   }
 
-  player.addEventListener('playing', () => {
-    reconnectAttempts = 0; // se reconectó bien, resetea el contador de backoff
-    disarmStallWatchdog();
-    setStatus('live');
-    if (currentIndex !== null) {
-      stationNameEl.textContent = STATIONS[currentIndex].name;
-      if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'playing';
-    }
-  });
-  player.addEventListener('waiting', () => {
-    setStatus('buffering');
-    armStallWatchdog(); // si se queda "colgado" en buffering, forzamos reconexión
-  });
-  player.addEventListener('pause', () => {
-    if (currentIndex !== null && !manualStop) setStatus('buffering');
-  });
-  player.addEventListener('stalled', () => attemptReconnect());
-  player.addEventListener('error', () => {
-    if (currentIndex !== null && !manualStop) {
-      attemptReconnect();
-    } else {
-      setStatus('off');
-    }
-  });
+  // ---------- eventos del <audio> ----------
+  // Los listeners se ligan a cada elemento (por si se recrea) y se ignoran
+  // los eventos de un elemento viejo que ya no es el activo.
+  function bindPlayerEvents(el) {
+    const on = (type, fn) => el.addEventListener(type, (e) => {
+      if (e.target !== player) return;
+      fn(e);
+    });
 
-  // Detecta cuando el navegador recupera / pierde la conexión a internet.
-  // Esto es lo más importante en redes móviles: si se pierde la señal del
-  // todo, dejamos de gastar intentos y reconectamos al instante al volver.
-  window.addEventListener('online', () => {
-    if (currentIndex !== null && !manualStop) {
-      reconnectAttempts = 0;
-      clearTimeout(reconnectTimer);
-      reconnectScheduled = false;
-      connectNow();
-    }
-  });
+    on('playing', () => {
+      reconnectAttempts = 0; // conectó bien: reinicia el backoff
+      clearTimeout(pauseTimer);
+      disarmStallWatchdog();
+      lastProgressAt = Date.now();
+      setStatus('live');
+      if (currentIndex !== null) {
+        stationNameEl.textContent = STATIONS[currentIndex].name;
+        if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'playing';
+      }
+    });
+
+    on('waiting', () => {
+      if (currentIndex === null || manualStop) return;
+      setStatus('buffering');
+      armStallWatchdog(); // si se cuelga en buffering, forzamos reconexión
+    });
+
+    // 'stalled' se dispara a veces en streams sanos: en vez de reconectar
+    // de inmediato, dejamos que el watchdog decida si de verdad no avanza.
+    on('stalled', () => {
+      if (currentIndex === null || manualStop) return;
+      armStallWatchdog();
+    });
+
+    // Corte limpio del servidor/operador.
+    on('ended', () => {
+      if (currentIndex !== null && !manualStop) attemptReconnect();
+    });
+
+    // Pausa que NO hizo el usuario (SO, llamada, auriculares, ahorro de batería).
+    on('pause', () => {
+      if (currentIndex === null || manualStop) return;
+      setStatus('buffering');
+      clearTimeout(pauseTimer);
+      pauseTimer = setTimeout(() => {
+        if (player.paused && currentIndex !== null && !manualStop && !reconnectScheduled) {
+          connectNow();
+        }
+      }, 1500);
+    });
+
+    on('error', () => {
+      // Ignorar el 'error' espurio al limpiar el src nosotros mismos.
+      if (!player.getAttribute('src')) return;
+      if (currentIndex !== null && !manualStop) {
+        attemptReconnect();
+      } else {
+        setStatus('off');
+      }
+    });
+  }
+  bindPlayerEvents(player);
+
+  // ---------- red y ciclo de vida ----------
+
+  // Vuelve la red: reconectar al instante.
+  window.addEventListener('online', () => reconnectImmediately());
+
   window.addEventListener('offline', () => {
-    if (currentIndex !== null) {
+    if (currentIndex !== null && !manualStop) {
       clearTimeout(reconnectTimer);
       disarmStallWatchdog();
       reconnectScheduled = false;
@@ -603,26 +717,31 @@
     }
   });
 
-  // Al volver de segundo plano / pantalla bloqueada, el audio puede haber
-  // quedado suspendido por el sistema operativo sin disparar ningún evento
-  // del <audio>. Revisamos activamente al recuperar el foco.
+  // En Android/Chrome, navigator.onLine casi siempre dice "true" aunque no haya
+  // datos. El evento 'change' de navigator.connection sí avisa de cambios de
+  // antena / wifi <-> 4G, que es cuando el TCP del stream queda muerto.
+  if (navigator.connection && navigator.connection.addEventListener) {
+    navigator.connection.addEventListener('change', () => {
+      clearTimeout(netDebounce);
+      netDebounce = setTimeout(() => reconnectImmediately(), 1000);
+    });
+  }
+
+  // Al volver de segundo plano / pantalla bloqueada el audio pudo quedar
+  // suspendido sin disparar eventos. Revisamos activamente.
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'visible' && currentIndex !== null && !manualStop) {
       if (player.paused || player.readyState < 2) {
-        reconnectAttempts = 0;
-        clearTimeout(reconnectTimer);
-        reconnectScheduled = false;
-        connectNow();
+        reconnectImmediately();
       }
     }
   });
 
-  // Media Session: ayuda a que iOS/Android traten esto como audio legítimo
-  // en segundo plano (menos probable que el SO mate el stream) y da controles
-  // en la pantalla de bloqueo.
+  // Media Session: controles en pantalla de bloqueo y mejor tratamiento
+  // del audio en segundo plano.
   if ('mediaSession' in navigator) {
     navigator.mediaSession.setActionHandler('play', () => {
-      if (currentIndex !== null) player.play().catch(() => attemptReconnect());
+      if (currentIndex !== null) player.play().catch(onPlayReject);
     });
     navigator.mediaSession.setActionHandler('pause', () => {
       if (currentIndex !== null) toggleStation(currentIndex);
@@ -632,7 +751,7 @@
     });
   }
 
-  // Register service worker for basic offline app-shell / installability
+  // Service worker: app shell / instalable
   if ('serviceWorker' in navigator) {
     window.addEventListener('load', () => {
       navigator.serviceWorker.register('sw.js').catch(() => {});
